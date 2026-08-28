@@ -287,6 +287,7 @@
     <button class="chip" data-sort="off52">52W</button>
     <button class="chip" data-sort="chg">Kurs Tag</button>
     <button class="chip filt" id="nearBtn">Nahe Hoch</button>
+    <button class="chip filt" id="mcapBtn">Nur ab 1 Mrd. $</button>
   </div>
 </header>
 
@@ -614,6 +615,55 @@ function toggleGroup(label){
   renderCached();
 }
 let sortMode = localStorage.getItem('rsc.sort') || 'orig';
+let mcapFilter = localStorage.getItem('rsc.mcapfilter')==='1';   // nur Coins ab 1 Mrd. $ zeigen?
+
+/* ---------- Market Cap (CoinGecko, separat von Twelve Data) ----------
+   Twelve Data liefert bei Krypto keine Market Cap (nur OHLC+Volume). CoinGecko-
+   /coins/markets?symbols=... loest Ticker-Symbole direkt und zuverlaessig auf (getestet:
+   auch kollisionsgefaehrdete wie AR/RAY/ENA/OP landen beim richtigen Coin) — keine eigene
+   Ticker->ID-Mapping-Tabelle noetig. Oeffentlicher Endpunkt, kein API-Key, CORS-offen
+   (access-control-allow-origin: *). Eigener Tages-Cache, unabhaengig vom Twelve-Data-Limit. */
+let MCAP = {};   // {TICKER: {cap, rank}}
+function loadMcapCache(){
+  try{ const c = JSON.parse(localStorage.getItem('rsc.mcap')); if(c && c.map) MCAP = c.map; return c; }
+  catch(e){ return null; }
+}
+function saveMcapCache(map){ try{ localStorage.setItem('rsc.mcap', JSON.stringify({t:Date.now(), map})); }catch(e){} }
+function mcapCacheIsToday(){
+  const c = (()=>{ try{ return JSON.parse(localStorage.getItem('rsc.mcap')); }catch(e){ return null; } })();
+  return !!c && new Date(c.t).toDateString() === new Date().toDateString();
+}
+async function fetchMarketCaps(tickers){
+  const out = {};
+  for(let i=0;i<tickers.length;i+=45){
+    const chunk = tickers.slice(i, i+45);
+    const syms = chunk.map(t=>t.toLowerCase()).join(',');
+    try{
+      const r = await fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&symbols=${encodeURIComponent(syms)}&per_page=250`);
+      const j = await r.json();
+      if(Array.isArray(j)) j.forEach(c=>{ out[c.symbol.toUpperCase()] = {cap:c.market_cap, rank:c.market_cap_rank}; });
+    }catch(e){ /* Market Cap ist ein Bonus-Feature — bei Fehlschlag laeuft die App ohne weiter */ }
+    if(i+45 < tickers.length) await sleep(1500);
+  }
+  return out;
+}
+// Einmal pro Tag (nicht bei jedem Render/Refresh) — unabhaengig vom Twelve-Data-Ladelauf,
+// blockiert ihn deshalb nicht (nicht awaited).
+async function refreshMarketCapsIfStale(){
+  if(mcapCacheIsToday()){ loadMcapCache(); return; }
+  const tickers = [...new Set(ROWS.filter(r=>r.type==='tk').map(r=>r.ticker))];
+  if(!tickers.length) return;
+  const fresh = await fetchMarketCaps(tickers);
+  if(Object.keys(fresh).length){ MCAP = fresh; saveMcapCache(MCAP); renderCached(); }
+}
+function fmtCap(n){
+  if(n==null) return null;
+  if(n>=1e12) return (n/1e12).toFixed(2)+'T';
+  if(n>=1e9) return (n/1e9).toFixed(1)+'B';
+  if(n>=1e6) return (n/1e6).toFixed(0)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(0)+'K';
+  return String(Math.round(n));
+}
 
 /* ---------- Parsing ---------- */
 function parseTickers(text){
@@ -820,6 +870,109 @@ function blockStrength(bl, dataMap){
   return vals.length%2 ? vals[m] : (vals[m-1]+vals[m])/2;
 }
 
+/* ---------- Marktbreite (Crypto-Makro: Dominance, ETH/BTC, Alt-Breadth) ---------- */
+// Dominance kommt von CoinGecko /global — oeffentlich, CORS-offen, kein Key. Liefert nur den
+// AKTUELLEN Stand, keine Historie (die ist bei CoinGecko kostenpflichtig) — bewusste Grenze,
+// siehe Notion-Dokument. Frisch gezogen bei jedem Oeffnen des Reiters, nicht dauerhaft gecacht.
+let DOMINANCE = null;
+async function fetchDominance(){
+  try{
+    const r = await fetch('https://api.coingecko.com/api/v3/global');
+    const j = await r.json();
+    const d = j.data;
+    DOMINANCE = {
+      btc: d.market_cap_percentage.btc,
+      eth: d.market_cap_percentage.eth,
+      totalUsd: d.total_market_cap.usd,
+      chg24h: d.market_cap_change_percentage_24h_usd
+    };
+  }catch(e){ /* Bonus-Panel — App laeuft ohne Dominance-Daten weiter */ }
+  if(tabMode==='markt') renderCached();
+}
+// Alt-Breadth-Index: eigener, mit Historie versehener Ersatz fuer TOTAL2 (das CoinGecko nur
+// als aktuellen Wert liefert). Pro Tag im Fenster: Anteil der Coins, die seit Fensterstart
+// staerker gelaufen sind als BTC. Kostet keinen zusaetzlichen Abruf — nutzt die eh schon
+// geladenen Coin-Daten. Rechnet IMMER gegen BTC, unabhaengig vom vs-BTC/vs-USD-Umschalter
+// oben (der Umschalter betrifft nur die Coin-Liste, nicht dieses Makro-Signal).
+function computeAltBreadth(dataMap, windowSize){
+  const btc = dataMap && dataMap[REF_SYMBOL];
+  if(!btc || !btc.d || !btc.d.length) return null;
+  const btcIdx = Object.fromEntries(btc.d.map((dt,i)=>[dt,i]));
+  const dates = btc.d.slice(-windowSize);
+  if(dates.length<3) return null;
+  const startDate = dates[0];
+  const bv0 = btc.c[btcIdx[startDate]];
+  const tickers = [...new Set(ROWS.filter(r=>r.type==='tk').map(r=>r.ticker))].filter(t=>t!==REF_SYMBOL);
+  const coinIdx = {};
+  tickers.forEach(t=>{ const d=dataMap[t]; if(d && d.d) coinIdx[t] = Object.fromEntries(d.d.map((dt,i)=>[dt,i])); });
+  const values = dates.map(dt=>{
+    const bvNow = btc.c[btcIdx[dt]];
+    let above=0, total=0;
+    tickers.forEach(t=>{
+      const d = dataMap[t]; const idx = coinIdx[t];
+      if(!d || !idx || idx[startDate]==null || idx[dt]==null) return;
+      const r0 = d.c[idx[startDate]]/bv0, rNow = d.c[idx[dt]]/bvNow;
+      total++; if(rNow>r0) above++;
+    });
+    return total>=3 ? above/total : null;
+  });
+  return values.every(v=>v==null) ? null : values;
+}
+function renderMarkt(dataMap){
+  let html = '';
+  if(!DOMINANCE){
+    html += `<div class="empty-state"><h2>Lade Marktdaten …</h2><p>Dominance-Zahlen kommen von CoinGecko.</p></div>`;
+  } else {
+    const btcD=DOMINANCE.btc, ethD=DOMINANCE.eth, total=DOMINANCE.totalUsd;
+    const total2 = total*(1-btcD/100), total3 = total*(1-btcD/100-ethD/100);
+    const chg = DOMINANCE.chg24h, chgCol = chg>=0?'var(--up)':'var(--down)';
+    const kachel = (lab, val, sub) =>
+      `<div class="dash-card"><h5>${lab}</h5><div class="ln" style="padding:2px 0"><b style="width:auto;font-size:16px">${val}</b></div>`
+      + (sub?`<div class="leer" style="color:${sub.col}">${sub.txt}</div>`:'') + `</div>`;
+    html += `<div class="dash-grp"><h4>Dominance <span style="color:var(--faint)">· aktueller Stand, keine Historie (Gratis-Grenze von CoinGecko)</span></h4>
+      <div class="dash-cols">
+        ${kachel('BTC.D', btcD.toFixed(1)+'%')}
+        ${kachel('ETH.D', ethD.toFixed(1)+'%')}
+        ${kachel('TOTAL', fmtCap(total)+' $', {col:chgCol, txt:(chg>=0?'+':'')+chg.toFixed(1)+'% · 24h'})}
+        ${kachel('TOTAL2 (Alts)', fmtCap(total2)+' $')}
+      </div>
+      <div class="dash-cols">${kachel('TOTAL3 (Long-Tail-Alts)', fmtCap(total3)+' $')}</div>
+      <div class="dash-legend" style="padding:8px 0 0">BTC.D steigend = risk-off, Alts schwach. TOTAL2/3 rein rechnerisch aus TOTAL × (1 − Dominance).</div>
+    </div>`;
+  }
+  const eb = dataMap && dataMap['ETHBTC'];
+  if(eb && eb.c && eb.c.length){
+    let full = eb.c.slice();
+    if(lagDays>0 && full.length>lagDays) full = full.slice(0,-lagDays);
+    const m = metricsFromFull(full);
+    if(m.rs){
+      const c = stsColor(m.pct);
+      html += `<div class="dash-grp"><h4>ETH/BTC <span style="color:var(--faint)">· wichtigstes Altseason-Signal</span></h4>
+        <div class="dash-card"><div style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1">${histogramSVG(m.rs)}</div>
+          <span class="sts" style="background:${c.bg};color:${c.fg}">${m.pct==null?'—':Math.round(m.pct*100)+'%'}</span>
+        </div>
+        <div class="dash-legend" style="padding:6px 0 0">Aktuell ${eb.c.at(-1)} · ${windowN}-Tage-Perzentil, direkt (kein Benchmark-Teilen). Steigend = ETH schlaegt BTC.</div></div></div>`;
+    }
+  } else {
+    html += `<div class="dash-legend" style="padding:8px 12px">ETH/BTC noch nicht geladen — läuft beim nächsten „Aktualisieren" automatisch mit.</div>`;
+  }
+  const breadth = computeAltBreadth(dataMap, windowN);
+  if(breadth){
+    const vals = breadth.filter(v=>v!=null);
+    if(vals.length>=3){
+      const cur = vals.at(-1), c = stsColor(cur);
+      html += `<div class="dash-grp"><h4>Alt-Breadth-Index <span style="color:var(--faint)">· % der Coins mit RS &gt; 1 vs. BTC — selbst berechnet, MIT Historie</span></h4>
+        <div class="dash-card"><div style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1">${histogramSVG(vals)}</div>
+          <span class="sts" style="background:${c.bg};color:${c.fg}">${Math.round(cur*100)}%</span>
+        </div>
+        <div class="dash-legend" style="padding:6px 0 0">Steigt = Altcoins gewinnen Breite gegen BTC (Altseason-Frühindikator). Basis: alle geladenen Coins außer BTC, Fenster ${windowN} Tage.</div></div></div>`;
+    }
+  }
+  $('#main').innerHTML = html || emptyState('tickers');
+}
+
 /* ---------- Übersicht ---------- */
 // Pro Gruppe ein Farbstreifen (Monatsstärke auf einen Blick) und darunter die beiden
 // Extreme: stärkste/schwächste nach RS % (Monat) und nach Thrust (Woche).
@@ -994,8 +1147,9 @@ function render(dataMap){
   }
   if(!ROWS.length){ main.innerHTML = emptyState('tickers'); return; }
   renderStatus(dataMap);
-  $('#sortbar').style.display = viewMode==='dash' ? 'none' : '';
+  $('#sortbar').style.display = viewMode==='list' ? '' : 'none';
   if(viewMode==='dash'){ renderDash(dataMap); return; }
+  if(viewMode==='markt'){ renderMarkt(dataMap); return; }
 
   let html = '';
   // BTC ist regulaeres Mitglied der Ticker-Liste (Gruppe "Referenz"), anders als der
@@ -1024,6 +1178,18 @@ function render(dataMap){
   const colHead = `<div class="colhead"><span></span><span></span>`
     + `<span class="${sortMode==='thrust'?'hi':''}">RS Thrust</span>`
     + `<span class="${monatIstAktiv?'hi':''}">${sortMode==='pct3m'?'3 Monate':'Monat '+windowN+'T'}</span><span></span></div>`;
+  // Sektoren-Sektion oben, vor den Einzel-Coins: synthetische, nach Market Cap gewichtete
+  // Gruppen-Aggregate, gegeneinander gerankt — Pendant zu XLK/XLF & Co. bei Aktien (die es
+  // bei Krypto als handelbare Instrumente nicht gibt). Braucht Market-Cap-Daten (MCAP);
+  // ohne sie (noch nicht geladen) zeigt computeGroupAggregates einfach nichts an.
+  if(tabMode==='groups' && Object.keys(MCAP).length){
+    const groups = computeGroupAggregates(dataMap);
+    if(groups.length>1){
+      html += `<div class="group-head">Sektoren <span class="gcount">${groups.length}</span></div>`;
+      html += colHead;
+      groups.forEach((g,i)=>{ html += groupRowHTML(g, i+1); });
+    }
+  }
   // Im Gruppen-Reiter die Themenbloecke selbst nach Staerke ordnen, damit oben steht,
   // wo das Kapital liegt — statt alphabetisch oder in Eingabereihenfolge.
   let ordered = blocks;
@@ -1045,6 +1211,9 @@ function render(dataMap){
     let items = bl.items;
     if(nearOnly){
       items = items.filter(r=>{ const d=dataMap&&dataMap[r.ticker]; return d && d.offHigh!=null && d.offHigh>=NEAR_HIGH; });
+    }
+    if(mcapFilter){
+      items = items.filter(r=> !MCAP[r.ticker] || MCAP[r.ticker].cap>=1e9);
     }
     if(sortMode!=='orig'){
       // Zweitkriterium: Bei gleicher Monats-RS entscheidet der Thrust. Ohne das standen
@@ -1094,7 +1263,10 @@ function rowHTML(r, d, rank){
     chg = teile.join('');
     const t = thrColor(d.thrust);
     thrCell = `<span class="thr${sortMode==='thrust'?' hi':''}" style="background:${t.bg};color:${t.fg}">${d.thrust==null?'—':Math.round(d.thrust*100)+'%'}</span>`;
-    metaLine = '';
+    // Market Cap + Rang als kleine Zeile unter dem Namen (wie THR/1M-Zeile frueher) —
+    // bewusst KEINE eigene Spalte, sonst wird's auf dem iPhone-Screen zu eng.
+    const mc = MCAP[r.ticker];
+    metaLine = mc ? `<span class="meta"><span class="lab">#${mc.rank}</span>${fmtCap(mc.cap)} $</span>` : '';
   } else {
     spark = emptySpark;
     sts = `<span class="sts" style="color:var(--faint)">·</span>`;
@@ -1120,6 +1292,33 @@ function rowHTML(r, d, rank){
     <span class="col4">${tvIcon}</span>
     ${chg ? `<span class="metrics">${chg}</span>` : ''}
   </div>${holdingsHTML(r.ticker)}`;
+}
+// Zeile fuer ein Gruppen-Aggregat (synthetischer Sektor-Wert) — eigene, kleinere Funktion
+// statt rowHTML mit noch mehr Bedingungen zu ueberladen: kein echter Ticker, also kein
+// Chart-Link, keine Bestandteile, keine Market-Cap-Zeile (das IST ja die Summe der Caps).
+function groupRowHTML(g, rank){
+  const spark = histogramSVG(g.rs);
+  const c = stsColor(g.peerPct);
+  const sts = `<span class="sts hi" style="background:${c.bg};color:${c.fg}">${Math.round(g.peerPct*100)}%</span>`;
+  const barCol = g.peerPct>=0.65?'var(--up)':(g.peerPct<0.3?'var(--down)':'var(--faint)');
+  const t = thrColor(g.thrust);
+  const thrCell = `<span class="thr" style="background:${t.bg};color:${t.fg}">${g.thrust==null?'—':Math.round(g.thrust*100)+'%'}</span>`;
+  let chg = '';
+  if(g.dayRS!=null){
+    const useSig = sigmaDay && g.daySigma!=null;
+    const v = useSig ? g.daySigma : g.dayRS;
+    chg = `<span class="m"><i>RS Tag</i><b style="color:${v>=0?'var(--up)':'var(--down)'}">${useSig ? (v>=0?'+':'')+v.toFixed(1)+'σ' : fmtChg(v)}</b></span>`;
+  }
+  const nm = `<span class="nm">${g.count} Coins · Market-Cap-gewichtet</span>`;
+  return `<div class="row">
+    <span class="rank-badge" style="background:${barCol}"></span>
+    <span class="tk"><span class="rnk">${rank}</span>${esc(g.label)}${nm}</span>
+    ${spark}
+    ${thrCell}
+    ${sts}
+    <span class="col4"></span>
+    ${chg ? `<span class="metrics">${chg}</span>` : ''}
+  </div>`;
 }
 function fmtChg(v){ if(v==null||isNaN(v)) return ''; const s=v>=0?'+':''; return s+v.toFixed(1)+'%'; }
 function esc(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -1230,6 +1429,9 @@ async function fetchSeries(symbol, key, outputsize){
 async function refresh(opts={}){
   const key = localStorage.getItem(LS.key);
   if(!key){ openSheet('set'); return; }
+  // Laeuft nebenher, eigene API (CoinGecko), zaehlt nicht gegen das Twelve-Data-Limit —
+  // deshalb nicht awaited, blockiert den Preis-Ladelauf nicht.
+  refreshMarketCapsIfStale();
   // Immer die volle Historie holen, nicht nur das aktuelle Fenster.
   // Twelve Data rechnet Credits pro Anfrage, nicht pro Zeile — mehr Daten kosten also nichts
   // extra, machen aber jede Fensteränderung zu einer reinen Neuberechnung ohne Neuladen.
@@ -1237,6 +1439,10 @@ async function refresh(opts={}){
   const forceAll = opts.force===true;
 
   const syms = [...new Set(ROWS.filter(r=>r.type==='tk').map(r=>r.ticker))];   // enthaelt BTC
+  // ETHBTC ist kein Coin aus der Ticker-Liste, sondern ein synthetischer Zusatz-Eintrag fuer
+  // den Marktbreite-Reiter (ETH/BTC-Histogramm) — laeuft im selben inkrementellen,
+  // ratenlimitierten Lauf mit, damit er dieselbe Tages-Cache-/Wiederaufnahme-Logik erbt.
+  if(!syms.includes('ETHBTC')) syms.push('ETHBTC');
 
   // Bestehenden Cache laden und weiterverwenden (inkrementell)
   const cached = loadCache() || {};
@@ -1276,15 +1482,21 @@ async function refresh(opts={}){
     showStatus('live', `Lade ${sym} … ${wakeInfo()}`, `${done}/${totalTodo}`);
     try{
       let s = null;
-      try{ s = await fetchSeries(pairSymbol(sym), key, need); }
-      catch(e1){
-        // Manche Coins (oft neuere Meme-/Hype-Token, z.B. WIF, BONK, HYPE) fuehrt Twelve
-        // Data nur gegen USDT statt USD. Zweiter Versuch nur im Fehlerfall — kostet bei den
-        // ueblichen USD-Paaren keinen Extra-Abruf. Per Test 2026-08-27 verifiziert: WIF,
-        // BONK, HYPE, FLOKI, PUMP brauchen diesen Fallback, TON/JUP/PLUME/BEAM/CFG/KCS
-        // liefert Twelve Data unter keinem der beiden Paare.
-        await sleep(500);
-        s = await fetchSeries(sym.toUpperCase()+'/USDT', key, need);
+      if(sym==='ETHBTC'){
+        // Sonderfall fuer den Marktbreite-Reiter: direktes ETH/BTC-Paar, kein USD-Umweg,
+        // kein USDT-Fallback (das Paar existiert oder nicht).
+        s = await fetchSeries('ETH/BTC', key, need);
+      } else {
+        try{ s = await fetchSeries(pairSymbol(sym), key, need); }
+        catch(e1){
+          // Manche Coins (oft neuere Meme-/Hype-Token, z.B. WIF, BONK, HYPE) fuehrt Twelve
+          // Data nur gegen USDT statt USD. Zweiter Versuch nur im Fehlerfall — kostet bei den
+          // ueblichen USD-Paaren keinen Extra-Abruf. Per Test 2026-08-27 verifiziert: WIF,
+          // BONK, HYPE, FLOKI, PUMP brauchen diesen Fallback, TON/JUP/PLUME/BEAM/CFG/KCS
+          // liefert Twelve Data unter keinem der beiden Paare.
+          await sleep(500);
+          s = await fetchSeries(sym.toUpperCase()+'/USDT', key, need);
+        }
       }
       if(s && s.length>=3){
         const trimmed = s.slice(-HISTORY);
@@ -1449,22 +1661,69 @@ function stochPos(w){
 // Baut eine Datum->Kurs-Map aus BTCs roher Preisreihe. Grundlage fuer den vs-BTC-Modus.
 // null im vs-USD-Modus oder wenn BTC noch nicht geladen ist.
 function buildBtcMap(dataMap){
-  if(refMode!=='btc') return null;
+  if(refMode!=='btc' || !dataMap) return null;
   const btc = dataMap[REF_SYMBOL];
   if(!btc || !btc.d || !btc.d.length) return null;
   return Object.fromEntries(btc.d.map((dt,i)=>[dt, btc.c[i]]));
+}
+// Liefert Datum+Wert parallel (nicht nur den Wert) — wird fuer die Gruppen-Aggregate
+// gebraucht, die mehrere Coins tagesgenau nach Datum (nicht nach Array-Position) zu einem
+// gewichteten Mittel zusammenfassen muessen.
+function refSeriesWithDates(dataMap, sym, btcMap){
+  const d = dataMap[sym];
+  if(!d || !d.d || !d.c || !d.d.length) return null;
+  if(refMode!=='btc') return {dates:d.d, values:d.c};
+  if(!btcMap) return null;
+  const dates=[], values=[];
+  for(let i=0;i<d.d.length;i++){ const bv=btcMap[d.d[i]]; if(bv!=null){ dates.push(d.d[i]); values.push(d.c[i]/bv); } }
+  return {dates, values};
 }
 // Liefert die volle, ref-mode-abhaengige Kursreihe eines Coins: im vs-BTC-Modus
 // Coin-Kurs/BTC-Kurs am selben Datum (Datums-Abgleich statt Index-Position, damit ein
 // zeitversetzt gecachter Coin nicht gegen den falschen BTC-Tag geteilt wird), im
 // vs-USD-Modus die rohe Preisreihe direkt.
 function refFullSeries(dataMap, sym, btcMap){
-  const d = dataMap[sym];
-  if(!d || !d.d || !d.c || !d.d.length) return null;
-  if(refMode!=='btc') return d.c.slice();
-  if(!btcMap) return null;
-  const out = [];
-  for(let i=0;i<d.d.length;i++){ const bv=btcMap[d.d[i]]; if(bv!=null) out.push(d.c[i]/bv); }
+  const r = refSeriesWithDates(dataMap, sym, btcMap);
+  return r ? r.values : null;
+}
+
+// Leitet aus einer rohen (ref-mode-bereinigten) Zeitreihe alle Fenster-Kennzahlen ab:
+// Histogramm-Reihe, RS-%-Perzentile (Zeit/Stochastik), Thrust, Tages-RS (roh/Sigma),
+// 3-Monats-Perzentil. Gemeinsam genutzt von Coins (applyPct) UND Gruppen-Aggregaten
+// (computeGroupAggregates) — eine Gruppe bekommt dieselben Kennzahlen wie ein Coin.
+function metricsFromFull(full){
+  const out = {rs:null, pct:null, thrust:null};
+  if(!full || full.length<3) return out;
+  const w = full.slice(-windowN);
+  const base = w[0];
+  out.rs = w.map(x=> x/base);                // auf Fensterstart normiert, fuer das Histogramm
+  out.timePct = percentRank(out.rs, out.rs.at(-1));
+  out.stochPct = stochPos(out.rs);
+  out.thrust = weightedThrust(out.rs);
+  // Tages-RS: Veraenderung der RS am letzten Tag, in Prozent. Misst Rotation —
+  // steigt alles gleich stark, ist das 0, obwohl die Tagesperformance hoch war.
+  out.dayRS = w.length>=2 ? (w.at(-1)/w.at(-2) - 1) * 100 : null;
+  // Volatilitaetsbereinigte Variante: Tages-RS in Standardabweichungen der eigenen
+  // RS-Tagesschwankung. Antwortet auf "wie ungewoehnlich war die Bewegung fuer diese
+  // Gruppe" statt "wie gross war sie". Braucht keine zusaetzlichen Kursdaten.
+  out.daySigma = null;
+  if(w.length>=8){
+    const ch = [];
+    for(let i=1;i<w.length;i++) ch.push(w[i]/w[i-1]-1);
+    const mean = ch.reduce((a,b)=>a+b,0)/ch.length;
+    const sd = Math.sqrt(ch.reduce((a,b)=>a+(b-mean)*(b-mean),0)/(ch.length-1));
+    if(sd>0) out.daySigma = (ch.at(-1)) / sd;
+  }
+  out.pct = pctMode==='stoch' ? out.stochPct : out.timePct;
+  // "3 Monate": fester 90-Tage-Zeitraum, unabhaengig von windowN. Immer Zeit-Perzentil
+  // (unabhaengig vom RS-%-Spalte-Setting) — Peer-Rang/Stochastik ueber einen zweiten,
+  // versteckten Zeitraum haette kaum zusaetzlichen Wert und verdoppelt nur die Optionen.
+  const w3 = full.slice(-WINDOW_3M);
+  if(w3.length>=WINDOW_3M){
+    const base3 = w3[0];
+    const rs3 = w3.map(x=>x/base3);
+    out.pct3m = percentRank(rs3, rs3.at(-1));
+  } else out.pct3m = null;
   return out;
 }
 
@@ -1475,41 +1734,12 @@ function applyPct(dataMap){
   if(!dataMap) return;
   const btcMap = buildBtcMap(dataMap);
   Object.keys(dataMap).forEach(sym=>{
+    if(sym==='ETHBTC') return;   // eigene Behandlung im Marktbreite-Reiter, keine Ref-Division
     const d = dataMap[sym];
     if(!d) return;
     let full = refFullSeries(dataMap, sym, btcMap);
     if(lagDays>0 && full && full.length>lagDays) full = full.slice(0, -lagDays);
-    if(!full || full.length<3){ d.rs=null; d.pct=null; d.thrust=null; return; }
-    const w = full.slice(-windowN);
-    const base = w[0];
-    d.rs = w.map(x=> x/base);                // auf Fensterstart normiert, fuer das Histogramm
-    d.timePct = percentRank(d.rs, d.rs.at(-1));
-    d.stochPct = stochPos(d.rs);
-    d.thrust = weightedThrust(d.rs);
-    // Tages-RS: Veraenderung der RS am letzten Tag, in Prozent. Misst Rotation —
-    // steigt alles gleich stark, ist das 0, obwohl die Tagesperformance hoch war.
-    d.dayRS = w.length>=2 ? (w.at(-1)/w.at(-2) - 1) * 100 : null;
-    // Volatilitaetsbereinigte Variante: Tages-RS in Standardabweichungen der eigenen
-    // RS-Tagesschwankung. Antwortet auf "wie ungewoehnlich war die Bewegung fuer diese
-    // Gruppe" statt "wie gross war sie". Braucht keine zusaetzlichen Kursdaten.
-    d.daySigma = null;
-    if(w.length>=8){
-      const ch = [];
-      for(let i=1;i<w.length;i++) ch.push(w[i]/w[i-1]-1);
-      const mean = ch.reduce((a,b)=>a+b,0)/ch.length;
-      const sd = Math.sqrt(ch.reduce((a,b)=>a+(b-mean)*(b-mean),0)/(ch.length-1));
-      if(sd>0) d.daySigma = (ch.at(-1)) / sd;
-    }
-    d.pct = pctMode==='stoch' ? d.stochPct : d.timePct;
-    // "3 Monate": fester 90-Tage-Zeitraum, unabhaengig von windowN. Immer Zeit-Perzentil
-    // (unabhaengig vom RS-%-Spalte-Setting) — Peer-Rang/Stochastik ueber einen zweiten,
-    // versteckten Zeitraum haette kaum zusaetzlichen Wert und verdoppelt nur die Optionen.
-    const w3 = full.slice(-WINDOW_3M);
-    if(w3.length>=WINDOW_3M){
-      const base3 = w3[0];
-      const rs3 = w3.map(x=>x/base3);
-      d.pct3m = percentRank(rs3, rs3.at(-1));
-    } else d.pct3m = null;
+    Object.assign(d, metricsFromFull(full));
     // Abstand zum 52-Wochen-Hoch, aus dem Kurs — die Monats-RS kennt nur windowN Tage und
     // weiss nichts vom Jahreskontext. Genau diese Luecke schliesst der Wert.
     // Tages-Kursaenderung auf denselben Tag beziehen wie die Tages-RS. Fehlt der
@@ -1526,6 +1756,51 @@ function applyPct(dataMap){
     d.offLow  = (d.lo52 && bezug) ? (bezug/d.lo52 - 1)*100 : null;
   });
   if(pctMode==='peer') computePeerRanks(dataMap);
+}
+
+// ---------- Gruppen-Aggregate (Sektor-Ebene) ----------
+// Es gibt bei Krypto (anders als XLK/XLF... bei Aktien) keine handelbaren Sektor-
+// Instrumente. Die App baut sich daher pro Gruppe einen synthetischen, nach Market Cap
+// gewichteten RS-Wert: GruppenRS[t] = Σ(coinRS[t] × marketCap_coin) / Σ(marketCap_coin).
+// BTC-Anker zaehlt bewusst nicht mit (wie schon bei blockStrength) — er ist Vergleichslinie,
+// kein Sektor-Mitglied. Braucht Market-Cap-Daten (MCAP); ohne sie kein Aggregat moeglich.
+function groupAggregateSeries(dataMap, items, btcMap){
+  const byDate = new Map();   // datum -> {num, den}
+  items.forEach(r=>{
+    if(r.ticker===REF_SYMBOL) return;
+    const mc = MCAP[r.ticker];
+    if(!mc || !mc.cap) return;
+    const s = refSeriesWithDates(dataMap, r.ticker, btcMap);
+    if(!s) return;
+    for(let i=0;i<s.dates.length;i++){
+      const dt=s.dates[i], v=s.values[i];
+      const e = byDate.get(dt) || {num:0, den:0};
+      e.num += v*mc.cap; e.den += mc.cap;
+      byDate.set(dt, e);
+    }
+  });
+  const dates = [...byDate.keys()].sort();
+  if(!dates.length) return null;
+  return dates.map(dt=>{ const e=byDate.get(dt); return e.num/e.den; });
+}
+// Baut fuer jede Gruppe die Coin-Kennzahlen (Histogramm/Thrust/3M/Tag) UND rankt die
+// Gruppen zusaetzlich GEGENEINANDER (Peer-Rang wie computePeerRanks, aber auf Sektor-Ebene) —
+// das ist Jeffs zweistufige Logik: erst welcher Sektor fuehrt, dann welcher Coin im Sektor.
+function computeGroupAggregates(dataMap){
+  if(!dataMap) return [];
+  const btcMap = buildBtcMap(dataMap);
+  const blocks = buildBlocks().filter(b=>b.label);
+  const raw = blocks.map(b=>{
+    let full = groupAggregateSeries(dataMap, b.items, btcMap);
+    if(lagDays>0 && full && full.length>lagDays) full = full.slice(0, -lagDays);
+    const m = metricsFromFull(full);
+    const count = b.items.filter(r=>r.ticker!==REF_SYMBOL).length;
+    return {label:b.label, count, ...m};
+  }).filter(g=>g.rs && g.rs.length);
+  const lastVals = raw.map(g=>g.rs.at(-1));
+  raw.forEach(g=>{ g.peerPct = lastVals.length>=2 ? percentRank(lastVals, g.rs.at(-1)) : g.pct; });
+  raw.sort((a,b)=> b.peerPct-a.peerPct);
+  return raw;
 }
 
 // „heute geladen"-Tracking pro Tag
@@ -1628,22 +1903,25 @@ $('#btnSettings').onclick = ()=>openSheet('set');
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=closeSheets);
 $('#tickerBg').onclick=closeSheets; $('#setBg').onclick=closeSheets;
 
-// Reiterleiste: Übersicht + Coins. Die Aktien-App trennt Index/Sektoren, Industriegruppen
-// und Einzelaktien in drei Reiter — bei Krypto sind alle Coin-Gruppen gleichrangig, daher
-// nur ein flacher Reiter statt drei.
+// Reiterleiste: Übersicht + Coins + Markt. Die Aktien-App trennt Index/Sektoren,
+// Industriegruppen und Einzelaktien in drei Reiter — bei Krypto sind alle Coin-Gruppen
+// gleichrangig, daher nur ein flacher Coins-Reiter statt drei. "Markt" ist neu: die
+// Makro-Ebene (Dominance, ETH/BTC, Alt-Breadth) statt einzelner Coins.
 function buildTabs(){
   const bar = $('#viewbar');
   bar.innerHTML =
     `<button class="chip" data-tab="dash">Übersicht</button>` +
-    `<button class="chip" data-tab="groups">Coins</button>`;
+    `<button class="chip" data-tab="groups">Coins</button>` +
+    `<button class="chip" data-tab="markt">Markt</button>`;
   bar.querySelectorAll('.chip').forEach(c=>{
     c.onclick = ()=>{
       tabMode = c.dataset.tab;
-      viewMode = tabMode==='dash' ? 'dash' : 'list';
+      viewMode = tabMode==='dash' ? 'dash' : (tabMode==='markt' ? 'markt' : 'list');
       collapseAll();
       localStorage.setItem('rsc.tab', tabMode);
       localStorage.setItem('rsc.view', viewMode);
       markTabs(); renderCached(); window.scrollTo(0,0);
+      if(tabMode==='markt') fetchDominance();   // frisch bei jedem Oeffnen (CoinGecko-Rate-Limit unkritisch)
     };
   });
   markTabs();
@@ -1668,6 +1946,14 @@ $('#nearBtn').onclick = ()=>{
   nearOnly = !nearOnly;
   localStorage.setItem('rsc.near', nearOnly?'1':'0');
   $('#nearBtn').classList.toggle('active', nearOnly);
+  renderCached();
+};
+// Filter "Nur ab 1 Mrd. $ Market Cap" — blendet Micro-Caps aus. Ohne Market-Cap-Daten
+// (noch nicht geladen) wirkt der Filter nicht, statt faelschlich alles auszublenden.
+$('#mcapBtn').onclick = ()=>{
+  mcapFilter = !mcapFilter;
+  localStorage.setItem('rsc.mcapfilter', mcapFilter?'1':'0');
+  $('#mcapBtn').classList.toggle('active', mcapFilter);
   renderCached();
 };
 
@@ -1764,11 +2050,15 @@ $('#testConn').onclick = async ()=>{
 /* ---------- Init ---------- */
 loadTickers();
 loadHoldings();
+loadMcapCache();
 updateRefLabel();
 document.querySelectorAll('.chip[data-sort]').forEach(x=>x.classList.toggle('active', x.dataset.sort===sortMode));
 buildTabs();
 $('#nearBtn').classList.toggle('active', nearOnly);
+$('#mcapBtn').classList.toggle('active', mcapFilter);
 renderCached();
+if(!mcapCacheIsToday()) refreshMarketCapsIfStale();
+if(tabMode==='markt') fetchDominance();
 if('serviceWorker' in navigator){/* offline shell optional */}
 </script>
 </body>
