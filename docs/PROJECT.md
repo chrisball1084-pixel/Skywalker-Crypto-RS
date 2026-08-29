@@ -10,6 +10,7 @@ Skywalker Crypto RS ist eine mobile Web-App zur Relative-Strength- und Marktbrei
 - Dieses Dokument enthält dauerhafte technische Regeln und Architekturwissen.
 - Das zugehörige Notion-Dokument ist die Product Source of Truth für neue Ideen, Bugs, offene Anforderungen, Produktentscheidungen und den aktuellen Produktstatus.
 - Historische Notion-Changelogs nur lesen, wenn sie für die aktuelle Aufgabe relevant sind.
+- Notion ist **keine Langzeithistorie**; Git/GitHub übernimmt diese Rolle.
 
 ## Architektur
 
@@ -76,17 +77,25 @@ Live-App:
 
 Vor einem Release den aktuellen Branch-/GitHub-Pages-Mechanismus prüfen. Keine Deployment-Annahmen aus anderen Skywalker-Projekten übertragen, wenn sie hier nicht im Code/Repo bestätigt sind.
 
+## Notion Retention / Housekeeping
+
+- `CURRENT STATE` aktualisieren/ersetzen statt neue Statuschroniken anzuhängen.
+- Verarbeitete `INBOX`-Punkte und erledigte `OPEN`-Punkte entfernen.
+- `PRODUCT DECISIONS` nur für dauerhaft relevantes Produktwissen verwenden.
+- `CHANGELOG` auf **maximal 10 relevante Einträge bzw. ungefähr 60 Tage** begrenzen.
+- Coin-Listen, Providerdetails und lange technische Release-/Implementierungsprotokolle gehören in Repo/Code, nicht dauerhaft in Notion.
+
 ## Notion-Sync-Workflow
 
 Der Befehl **„Notion Sync durchführen“** bedeutet:
 
 1. `AGENTS.md` bzw. `CLAUDE.md` und dieses Dokument lesen.
-2. Im Notion Product Hub primär `CURRENT STATE`, `INBOX`, `OPEN` und relevante `PRODUCT DECISIONS` lesen.
-3. Historisches Archiv nur bei Bedarf heranziehen.
+2. Im Notion Product Hub primär `CURRENT STATE`, `INBOX`, `OPEN`, `WAITING FOR ME` und relevante `PRODUCT DECISIONS` lesen.
+3. Historische Quellen nur bei Bedarf heranziehen.
 4. Neue Anforderungen gegen den aktuellen Code verifizieren.
 5. Als Bug, Feature, Verbesserung, Frage oder Nutzerentscheidung klassifizieren.
 6. Klar definierte Änderungen klein und nachvollziehbar implementieren.
 7. Relevante Berechnungen, Datenabrufe und mobile Darstellung validieren.
 8. Dieses Dokument nur bei dauerhaft relevanten technischen Änderungen aktualisieren.
-9. Notion aufräumen und Status/Changelog kompakt aktualisieren.
+9. Notion gemäß Retention-Regel aufräumen und kompakt aktualisieren.
 10. Abschließend Änderungen, Validierung und offene Entscheidungen berichten.
